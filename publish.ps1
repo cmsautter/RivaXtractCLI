@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Multi-RID publisher + packager for rivaxtract.
+  Multi-RID publisher + packager for rivaxtract (versioned archives, file-only inside).
 
 .DESCRIPTION
   Builds self-contained, single-file binaries for:
@@ -8,12 +8,12 @@
     - linux-x64, linux-musl-x64, linux-arm64
     - osx-arm64, osx-x64
   Copies each artifact to: ./publish/<rid>/rivaxtract[.exe]
-  Then archives each folder:
-    - Windows RIDs:   ./publish/rivaxtract-<rid>.zip
-    - Non-Windows:    ./publish/rivaxtract-<rid>.tar.gz
+  Then archives each RID as:
+    - Windows RIDs:   ./publish/rivaxtract-<version>-<rid>.zip   (contains only rivaxtract.exe)
+    - Non-Windows:    ./publish/rivaxtract-<version>-<rid>.tar.gz (contains only rivaxtract)
 
-.USAGE
-  .\publish.ps1 -Project .\RivaXtractCLI.csproj
+.NOTES
+  Building archives on Windows cannot preserve Unix execute bits. Linux/macOS users may need: chmod +x rivaxtract
 #>
 
 param(
@@ -21,10 +21,28 @@ param(
   [string]$Configuration = "Release",
   [string]$TFM = "net8.0",
   [string]$AppName = "rivaxtract",
-  [string]$OutputRoot = "./publish"
+  [string]$OutputRoot = "./publish",
+  [string]$Version = ""   # optional override; otherwise read from ./version
 )
 
 $ErrorActionPreference = "Stop"
+
+# ---- read version file if not provided ----
+function Get-Version {
+  param([string]$Provided)
+  if ($Provided -and $Provided.Trim()) { return $Provided.Trim() }
+  $versionPath = Join-Path -Path $PSScriptRoot -ChildPath "version"
+  if (-not (Test-Path $versionPath)) {
+    Write-Warning "No -Version specified and '$versionPath' not found. Using '0.0.0'."
+    return "0.0.0"
+  }
+  $v = (Get-Content -Raw $versionPath).Trim()
+  if (-not $v) { $v = "0.0.0" }
+  return $v
+}
+
+$Version = Get-Version -Provided $Version
+Write-Host "Version: $Version" -ForegroundColor DarkGray
 
 # RIDs to publish
 $RIDs = @(
@@ -47,10 +65,9 @@ $PublishProps = @(
   "-p:DebugType=none"
 )
 
-# ---------------- helpers ----------------
+# ------------- helpers ----------------
 
 function Get-SevenZipPath {
-  # Try PATH first
   $candidates = @("7z", "7z.exe",
     "$Env:ProgramFiles\7-Zip\7z.exe",
     "$Env:ProgramFiles(x86)\7-Zip\7z.exe")
@@ -109,98 +126,106 @@ function Copy-Artifact {
 
   Copy-Item -Force $Src $dst
   Write-Host "  -> $dst" -ForegroundColor Green
+  return $dst
 }
 
-function New-Zip {
-  param([string]$SourceDir, [string]$ZipPath)
+function New-ZipFile {
+  param([string]$FilePath, [string]$ZipPath)
+  $dir     = Split-Path -Parent $FilePath
+  $name    = Split-Path -Leaf   $FilePath
+  $zipAbs  = [System.IO.Path]::GetFullPath($ZipPath)
 
   if ($SevenZip) {
-    if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-    # Pass args as an array; let PowerShell handle quoting
-    & $SevenZip @('a','-tzip','-mx=9','--', $ZipPath, $SourceDir) | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "7-Zip failed creating zip '$ZipPath' (exit $LASTEXITCODE)" }
-  } else {
-    # Fallback: Compress-Archive (doesn't preserve Unix exec bits)
-    if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-    $parent = Split-Path -Parent $SourceDir
-    $name   = Split-Path -Leaf   $SourceDir
-    Push-Location $parent
+    if (Test-Path $zipAbs) { Remove-Item $zipAbs -Force }
+    Push-Location $dir
     try {
-      Compress-Archive -Path $name -DestinationPath $ZipPath -Force
+      # 7z: add a single file named $name into $zipAbs (absolute path avoids nested publish/)
+      & $SevenZip @('a','-tzip','-mx=9','--', $zipAbs, $name) | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "7-Zip failed creating zip '$zipAbs' (exit $LASTEXITCODE)" }
+    } finally { Pop-Location }
+  } else {
+    if (Test-Path $zipAbs) { Remove-Item $zipAbs -Force }
+    Push-Location $dir
+    try {
+      Compress-Archive -Path $name -DestinationPath $zipAbs -Force
     } finally { Pop-Location }
   }
 }
 
-function New-TarGz {
-  param([string]$SourceDir, [string]$TgzPath)
+function New-TarGzFile {
+  param([string]$FilePath, [string]$TgzPath)
+  $dir     = Split-Path -Parent $FilePath
+  $name    = Split-Path -Leaf   $FilePath
+  $tgzAbs  = [System.IO.Path]::GetFullPath($TgzPath)
 
   if ($SevenZip) {
-    # Build a sibling .tar path robustly (do not rely on ChangeExtension(".tar.gz"))
-    $dir  = Split-Path -Parent $TgzPath
-    $base = Split-Path -Leaf   $TgzPath
-    $baseNoGz = [System.IO.Path]::GetFileNameWithoutExtension($base)  # strip .gz
-    $tmpTar = Join-Path $dir ($baseNoGz + '.tar')
+    # tmpTar = same base as .tar.gz but with .tar (strip .gz, then .tar if present)
+    $baseNoGz = [System.IO.Path]::GetFileNameWithoutExtension($tgzAbs)        # drop .gz
+    $baseNoTar= [System.IO.Path]::GetFileNameWithoutExtension($baseNoGz)      # drop .tar (if it existed)
+    $tmpTar   = Join-Path (Split-Path -Parent $tgzAbs) ($baseNoTar + '.tar')
 
     if (Test-Path $tmpTar) { Remove-Item $tmpTar -Force }
-    & $SevenZip @('a','-ttar','--', $tmpTar, $SourceDir) | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "7-Zip failed creating tar '$tmpTar' (exit $LASTEXITCODE)" }
+    Push-Location $dir
+    try {
+      & $SevenZip @('a','-ttar','--', $tmpTar, $name) | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "7-Zip failed creating tar '$tmpTar' (exit $LASTEXITCODE)" }
+    } finally { Pop-Location }
 
-    if (Test-Path $TgzPath) { Remove-Item $TgzPath -Force }
-    & $SevenZip @('a','-tgzip','--', $TgzPath, $tmpTar) | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "7-Zip failed gzip'ing '$tmpTar' -> '$TgzPath' (exit $LASTEXITCODE)" }
+    if (Test-Path $tgzAbs) { Remove-Item $tgzAbs -Force }
+    & $SevenZip @('a','-tgzip','--', $tgzAbs, $tmpTar) | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "7-Zip failed gzip'ing '$tmpTar' -> '$tgzAbs' (exit $LASTEXITCODE)" }
 
     Remove-Item $tmpTar -Force
-  } elseif ($HaveTar) {
-    # Use system tar: tar -czf out.tgz -C parent folderName
-    $parent = Split-Path -Parent $SourceDir
-    $name   = Split-Path -Leaf   $SourceDir
-    if (Test-Path $TgzPath) { Remove-Item $TgzPath -Force }
-    Push-Location $parent
-    try {
-      & tar -czf "$TgzPath" "$name"
-      if ($LASTEXITCODE -ne 0) { throw "tar failed creating '$TgzPath' (exit $LASTEXITCODE)" }
-    } finally { Pop-Location }
-  } else {
+  }
+  elseif ($HaveTar) {
+    if (Test-Path $tgzAbs) { Remove-Item $tgzAbs -Force }
+    # put *only* the file at archive root
+    & tar -czf "$tgzAbs" -C "$dir" "$name"
+    if ($LASTEXITCODE -ne 0) { throw "tar failed creating '$tgzAbs' (exit $LASTEXITCODE)" }
+  }
+  else {
     throw "Neither 7-Zip nor tar available to create tar.gz"
   }
 }
 
 
-function Archive-RidFolder {
-  param([Parameter(Mandatory=$true)][string]$Rid)
+function Archive-RidArtifact {
+  param(
+    [Parameter(Mandatory=$true)][string]$Rid,
+    [Parameter(Mandatory=$true)][string]$ArtifactPath,
+    [Parameter(Mandatory=$true)][string]$Version
+  )
 
-  $srcDir = Join-Path $OutputRoot $Rid
-  if (-not (Test-Path $srcDir)) { throw "Folder to archive not found: $srcDir" }
-
-  $baseName = "$AppName-$Rid"
+  $baseName = "$AppName-$Version-$Rid"
   if ($Rid.StartsWith("win-")) {
     $zip = Join-Path $OutputRoot "$baseName.zip"
-    New-Zip -SourceDir $srcDir -ZipPath $zip
+    New-ZipFile -FilePath $ArtifactPath -ZipPath $zip
     Write-Host "  + zip: $zip" -ForegroundColor Yellow
   } else {
     $tgz = Join-Path $OutputRoot "$baseName.tar.gz"
-    New-TarGz -SourceDir $srcDir -TgzPath $tgz
+    New-TarGzFile -FilePath $ArtifactPath -TgzPath $tgz
     Write-Host "  + tgz: $tgz" -ForegroundColor Yellow
   }
 }
 
-# --------------- main ---------------
+# ------------- main ----------------
 
-# Ensure output root exists
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 
 if ($SevenZip) {
   Write-Host "Using 7-Zip at: $SevenZip" -ForegroundColor DarkGray
+} elseif ($HaveTar) {
+  Write-Host "7-Zip not found; using tar for .tar.gz and Compress-Archive for .zip" -ForegroundColor DarkGray
 } else {
-  Write-Host "7-Zip not found; using Compress-Archive for .zip and tar.exe for .tar.gz (if present)" -ForegroundColor DarkGray
+  Write-Host "No 7-Zip and no tar; will still zip via Compress-Archive for Windows RIDs." -ForegroundColor DarkGray
 }
 
 foreach ($rid in $RIDs) {
   Invoke-DotnetPublish -Rid $rid
   $artifact = Get-ArtifactPath -Rid $rid
-  Copy-Artifact -Rid $rid -Src $artifact
-  Archive-RidFolder -Rid $rid
+  $copied   = Copy-Artifact -Rid $rid -Src $artifact   # also shows path in publish/<rid>/
+  Archive-RidArtifact -Rid $rid -ArtifactPath $copied -Version $Version
 }
 
 Write-Host "`nAll done. Artifacts and archives are under '$OutputRoot'." -ForegroundColor Green
-Write-Host "Note: ZIP does not preserve Unix execute bits; Linux/macOS users may need 'chmod +x $AppName' after extracting."
+Write-Host "Note: Linux/macOS users may need: chmod +x $AppName"
