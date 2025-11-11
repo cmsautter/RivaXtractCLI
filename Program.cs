@@ -226,14 +226,16 @@ internal static class Program {
         // rivaxtract export-views <archive> --out <root>
         //   [--views index,module-slot,module-name,name|all]
         //   [--mode hard|symlink|copy] [--dummy omit|marker]
+        //   [--overwrite ask|never|always]   // prompt if out dir exists and not empty
         if (args.Length < 1)
-            return Fail("Usage: rivaxtract export-views <archive> --out <root> [--views ...] [--mode hard|symlink|copy] [--dummy omit|marker]");
+            return Fail("Usage: rivaxtract export-views <archive> --out <root> [--views ...] [--mode hard|symlink|copy] [--dummy omit|marker] [--overwrite ask|never|always]");
 
         var archive = args[0];
         string outRoot = "";
         string viewsArg = "index,module-slot"; // sensible default
         string mode = "hard";
         string dummy = "marker";
+        int dirOverwrite = 1; // 0=never,1=ask,2=always
 
         for (int i = 1; i < args.Length; i++) {
             switch (args[i]) {
@@ -241,6 +243,17 @@ internal static class Program {
                 case "--views": viewsArg = NeedValue(args, ref i, "views list"); break;
                 case "--mode": mode = NeedValue(args, ref i, "mode"); break;
                 case "--dummy": dummy = NeedValue(args, ref i, "dummy policy"); break;
+                case "--overwrite":
+                {
+                    var v = NeedValue(args, ref i, "overwrite mode");
+                    dirOverwrite = v switch {
+                        "never" => 0,
+                        "ask" => 1,
+                        "always" => 2,
+                        _ => throw new ArgumentException("overwrite must be ask|never|always")
+                    };
+                    break;
+                }
                 default: throw new ArgumentException($"Unknown option for export-views: {args[i]}");
             }
         }
@@ -254,6 +267,35 @@ internal static class Program {
         }
 
         if (string.IsNullOrEmpty(outRoot)) return Fail("Missing --out <root>");
+
+        // If target dir exists and is non-empty, honor overwrite policy
+        var outFull = Path.GetFullPath(outRoot);
+        if (Directory.Exists(outFull)) {
+            bool nonEmpty;
+            try {
+                nonEmpty = Directory.EnumerateFileSystemEntries(outFull).Any();
+            } catch {
+                nonEmpty = true; // be conservative if listing fails
+            }
+
+            if (nonEmpty) {
+                switch (dirOverwrite) {
+                    case 0: // never
+                        return Fail($"Target dir exists and is not empty: '{outFull}'. Use --overwrite ask|always to proceed.");
+                    case 1: // ask
+                        if (Console.IsInputRedirected)
+                            return Fail($"Target dir exists and is not empty: '{outFull}'. Refusing to overwrite in non-interactive mode (use --overwrite always).");
+                        Console.Error.Write($"Target dir exists and is not empty: '{outFull}'. Proceed and overwrite? [y/N] ");
+                        var ans = Console.ReadLine();
+                        if (string.IsNullOrWhiteSpace(ans) ||
+                            !(ans.Equals("y", StringComparison.OrdinalIgnoreCase) || ans.Equals("yes", StringComparison.OrdinalIgnoreCase)))
+                            return Fail("Aborted by user.");
+                        break;
+                    case 2: // always
+                        break; // proceed
+                }
+            }
+        }
 
         var (_, dsa) = LoadDsa3(archive);
         using var ifs = new Ifstream(archive);
@@ -446,6 +488,19 @@ internal static class Program {
     private static void LinkToObject(string destPath, string objectsIdxDir, int entryIndex, string mode) {
         var src = Path.Combine(objectsIdxDir, entryIndex.ToString("D5") + ".dat");
         Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+
+        // If destination already exists, it may be a prior hardlink/symlink to src.
+        // Deleting first avoids self-copy or link-creation failures on reruns.
+        try {
+            if (File.Exists(destPath)) {
+                try {
+                    var attrs = File.GetAttributes(destPath);
+                    if ((attrs & FileAttributes.ReadOnly) != 0)
+                        File.SetAttributes(destPath, attrs & ~FileAttributes.ReadOnly);
+                } catch { /* ignore attribute errors */ }
+                try { File.Delete(destPath); } catch { /* if delete fails, fallback paths may still error */ }
+            }
+        } catch { /* non-fatal */ }
 
         switch (mode.ToLowerInvariant()) {
             case "hard":
@@ -1517,6 +1572,7 @@ Usage:
   export-views  <archive> --out <root>
                 [--views index,module-slot,module-name,name|all]
                 [--mode hard|symlink|copy] [--dummy omit|marker]
+                [--overwrite ask|never|always]
                 Write objects/idx/IIIII.dat and link/copy views.
 
   modify        <archive> [--out <new-archive>]
