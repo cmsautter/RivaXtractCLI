@@ -45,6 +45,13 @@ function Get-Version {
 $Version = Get-Version -Provided $Version
 Write-Host "Version: $Version" -ForegroundColor DarkGray
 
+# Resolve output root relative to the script directory to avoid nesting
+if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
+  $OutputAbs = $OutputRoot
+} else {
+  $OutputAbs = Join-Path $PSScriptRoot $OutputRoot
+}
+
 # RIDs to publish
 $RIDs = @(
   "win-x86",
@@ -150,7 +157,7 @@ function Copy-Artifact {
     [Parameter(Mandatory=$true)][string]$Rid,
     [Parameter(Mandatory=$true)][string]$Src
   )
-  $dstDir = Join-Path $OutputRoot $Rid
+  $dstDir = Join-Path $OutputAbs $Rid
 
   if (-not (Confirm-TargetDir -Path $dstDir -Force:$Force)) {
     Write-Warning "Skipping RID '$Rid' at '$dstDir' by user choice."
@@ -236,11 +243,11 @@ function Archive-RidArtifact {
 
   $baseName = "$AppName-$Version-$Rid"
   if ($Rid.StartsWith("win-")) {
-    $zip = Join-Path $OutputRoot "$baseName.zip"
+    $zip = Join-Path $OutputAbs "$baseName.zip"
     New-ZipFile -FilePath $ArtifactPath -ZipPath $zip
     Write-Host "  + zip: $zip" -ForegroundColor Yellow
   } else {
-    $tgz = Join-Path $OutputRoot "$baseName.tar.gz"
+    $tgz = Join-Path $OutputAbs "$baseName.tar.gz"
     New-TarGzFile -FilePath $ArtifactPath -TgzPath $tgz
     Write-Host "  + tgz: $tgz" -ForegroundColor Yellow
   }
@@ -248,7 +255,7 @@ function Archive-RidArtifact {
 
 # ------------- main ----------------
 
-New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $OutputAbs | Out-Null
 
 if ($SevenZip) {
   Write-Host "Using 7-Zip at: $SevenZip" -ForegroundColor DarkGray
