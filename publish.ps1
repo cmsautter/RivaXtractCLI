@@ -22,7 +22,8 @@ param(
   [string]$TFM = "net8.0",
   [string]$AppName = "rivaxtract",
   [string]$OutputRoot = "./publish",
-  [string]$Version = ""   # optional override; otherwise read from ./version
+  [string]$Version = "",   # optional override; otherwise read from ./version
+  [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
@@ -113,12 +114,49 @@ function Get-ArtifactPath {
   return $probe.FullName
 }
 
+function Confirm-TargetDir {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [switch]$Force
+  )
+  # If forcing, skip checks
+  if ($Force) { return $true }
+
+  if (-not (Test-Path -LiteralPath $Path)) { return $true }
+
+  $nonEmpty = $false
+  try {
+    $probe = Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop | Select-Object -First 1
+    if ($null -ne $probe) { $nonEmpty = $true }
+  } catch {
+    # If we can't list, err on the side of caution and prompt anyway
+    $nonEmpty = $true
+  }
+
+  if (-not $nonEmpty) { return $true }
+
+  Write-Warning "Target dir exists and is not empty: $Path"
+  try {
+    $ans = Read-Host "Proceed? Files may be overwritten. (y/N)"
+  } catch {
+    return $false
+  }
+  if ($ans -and ($ans.Trim().ToLower() -in @('y','yes'))) { return $true }
+  return $false
+}
+
 function Copy-Artifact {
   param(
     [Parameter(Mandatory=$true)][string]$Rid,
     [Parameter(Mandatory=$true)][string]$Src
   )
   $dstDir = Join-Path $OutputRoot $Rid
+
+  if (-not (Confirm-TargetDir -Path $dstDir -Force:$Force)) {
+    Write-Warning "Skipping RID '$Rid' at '$dstDir' by user choice."
+    return $null
+  }
+
   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
 
   $isWindows = $Rid.StartsWith("win-")
@@ -224,7 +262,11 @@ foreach ($rid in $RIDs) {
   Invoke-DotnetPublish -Rid $rid
   $artifact = Get-ArtifactPath -Rid $rid
   $copied   = Copy-Artifact -Rid $rid -Src $artifact   # also shows path in publish/<rid>/
-  Archive-RidArtifact -Rid $rid -ArtifactPath $copied -Version $Version
+  if ($copied) {
+    Archive-RidArtifact -Rid $rid -ArtifactPath $copied -Version $Version
+  } else {
+    Write-Warning "Did not archive RID '$rid' because copy was skipped."
+  }
 }
 
 Write-Host "`nAll done. Artifacts and archives are under '$OutputRoot'." -ForegroundColor Green
