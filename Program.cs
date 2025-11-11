@@ -1071,22 +1071,25 @@ private static int UnixSymlink(string target, string @new) => symlink(target, @n
 
     // extend build router
     // -----------------------
-    // build (verbatim from JSON + objects)
+    // build (JSON + objects)
     // -----------------------
     private static int CmdBuildFromJson(string[] args) {
-        // rivaxtract build <structure.json> --objects <root> --out <archive>
-        // - Verbatim build: preserves indices, slots, dummies, entry offsets and table offsets.
+        // rivaxtract build <structure.json> --objects <root> --out <archive> [--strict]
+        // - Default: accept payload size changes and repack with recomputed offsets/sizes.
+        // - --strict: require exact size match with JSON and do a verbatim write.
         if (args.Length < 1)
-            return Fail("Usage: rivaxtract build <structure.json> --objects <root> --out <archive>");
+            return Fail("Usage: rivaxtract build <structure.json> --objects <root> --out <archive> [--strict]");
 
         var jsonPath = args[0];
         string objectsRoot = "";
         string outArc = "";
+        bool strict = false;
 
         for (int i = 1; i < args.Length; i++) {
             switch (args[i]) {
                 case "--objects": objectsRoot = NeedValue(args, ref i, "objects root"); break;
                 case "--out": outArc = NeedValue(args, ref i, "output archive"); break;
+                case "--strict": strict = true; break;
                 default: throw new ArgumentException($"Unknown option for build: {args[i]}");
             }
         }
@@ -1107,23 +1110,47 @@ private static int UnixSymlink(string target, string @new) => symlink(target, @n
 
         // Load payloads by entry index from objects/idx
         var idxDir = ResolveIdxDir(objectsRoot);
-        var entryData = LoadEntryDataByIndex(root, idxDir); // validates presence & size
+        var entryData = LoadEntryDataByIndex(root, idxDir, strictSizes: false); // presence check; sizes validated below
 
-        // Compute exact final file length from JSON offsets+sizes
-        var total = ComputeExactArchiveSize(root);
-        using var ofs = new Ofstream(outArc, (int)total);
-
-        // Strict verbatim write: no relayout, no touching offsets
-        try {
-            dsa.WriteVerbatim(ofs, entryData, strictSizes: true);
-        } catch (IndexOutOfRangeException ex) {
-            throw new InvalidOperationException(
-                "Buffer write exceeded allocated size. Check that table offsets/sizes and modmap extents " +
-                "in JSON are consistent. (We now allocate for module/file tables, modmap, and data.)", ex);
+        // Check for size mismatches vs JSON
+        var mism = new List<(int index, uint jsonSize, int bytes)>();
+        for (int i = 0; i < root.Entries!.Count; i++) {
+            uint jsz = root.Entries[i].SizeU32;
+            int bsz = entryData[i].Length;
+            if (jsz != bsz) mism.Add((i, jsz, bsz));
         }
-        ofs.Close();
 
-        Console.Error.WriteLine($"built (verbatim) '{outArc}' from JSON '{jsonPath}' and objects '{idxDir}'");
+        if (mism.Count > 0 && !strict) {
+            foreach (var m in mism)
+                Console.Error.WriteLine($"info: size changed for {m.index:D5}.dat: JSON={m.jsonSize}, bytes={m.bytes}");
+
+            // Repack with recomputed offsets/sizes, preserving mapping
+            var total2 = dsa.ComputePackedSize(entryData);
+            using var ofs2 = new Ofstream(outArc, (int)total2);
+            dsa.RepackTo(ofs2, entryData);
+            ofs2.Close();
+            Console.Error.WriteLine($"built (repacked) '{outArc}' from JSON '{jsonPath}' and objects '{idxDir}' (sizes changed for {mism.Count} entries)");
+            return 0;
+        }
+
+        if (mism.Count > 0 && strict) {
+            foreach (var m in mism)
+                Console.Error.WriteLine($"error: size mismatch for {m.index:D5}.dat: JSON={m.jsonSize}, bytes={m.bytes}");
+            return 1;
+        }
+
+        // Verbatim path: exact match required (no relayout)
+        var total = ComputeExactArchiveSize(root);
+        using (var ofs = new Ofstream(outArc, (int)total)) {
+            try {
+                dsa.WriteVerbatim(ofs, entryData, strictSizes: true);
+            } catch (IndexOutOfRangeException ex) {
+                throw new InvalidOperationException(
+                    "Buffer write exceeded allocated size. Check that table offsets/sizes and modmap extents " +
+                    "in JSON are consistent. (We now allocate for module/file tables, modmap, and data.)", ex);
+            }
+        }
+        Console.Error.WriteLine($"built (verbatim) '{outArc}' from JSON '{jsonPath}' and objects '{idxDir}' (strict)");
         return 0;
     }
 
@@ -1271,7 +1298,7 @@ private static int UnixSymlink(string target, string @new) => symlink(target, @n
         throw new DirectoryNotFoundException($"Could not find objects/idx under '{objectsRoot}'");
     }
 
-    private static IList<byte[]> LoadEntryDataByIndex(JsonRoot root, string idxDir) {
+    private static IList<byte[]> LoadEntryDataByIndex(JsonRoot root, string idxDir, bool strictSizes = true) {
         if (root.Entries is null) throw new InvalidOperationException("JSON.entries missing");
         var list = new List<byte[]>(root.Entries.Count);
         for (int i = 0; i < root.Entries.Count; i++) {
@@ -1280,7 +1307,7 @@ private static int UnixSymlink(string target, string @new) => symlink(target, @n
                 throw new FileNotFoundException($"Missing payload object: {p}");
             var bytes = File.ReadAllBytes(p);
             var expected = root.Entries[i].SizeU32;
-            if (bytes.Length != expected)
+            if (strictSizes && bytes.Length != expected)
                 throw new InvalidOperationException($"Size mismatch for {Path.GetFileName(p)}: bytes={bytes.Length}, JSON={expected}");
             list.Add(bytes);
         }
@@ -1504,9 +1531,10 @@ Usage:
                 Rebuild archive with compacted layout while preserving indices,
                 slots, dummies and mapping. Offsets/sizes are recomputed.
 
-  build         <structure.json> --objects <root> --out <archive>
-                Verbatim build from JSON + objects. Preserves indices, slots, dummies,
-                table offsets and entry offsets. Fails on any size mismatch.
+  build         <structure.json> --objects <root> --out <archive> [--strict]
+                Build from JSON + objects.
+                - Default: accepts payload size changes and repacks with recomputed offsets/sizes.
+                - --strict: require exact size match and write verbatim (no relayout).
 
 Examples:
   rivaxtract export-json GAME.ALF --out GAME.structure.json --pretty
