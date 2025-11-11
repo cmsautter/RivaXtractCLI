@@ -303,11 +303,21 @@ internal static class Program {
         // 1) objects/idx/IIIII.dat
         var objectsIdx = Path.Combine(outRoot, "objects", "idx");
         Directory.CreateDirectory(objectsIdx);
+        int objectsWritten = 0, objectsSkippedEmpty = 0;
         for (int i = 0; i < dsa.Count; i++) {
             var e = (Dsa3Entry)dsa.Entries[i];
+
+            // Skip clearly non-existent entries (no name + zero size/offset/date)
+            if (IsClearlyNonexistent(e)) {
+                objectsSkippedEmpty++;
+                Console.Error.WriteLine($"warn: objects/idx: skipping non-existent entry {i:D5} (name='{e.Name ?? ""}', size={e.Size}, offset={e.Offset}, date={e.mDosDateTime})");
+                continue;
+            }
+
             var path = Path.Combine(objectsIdx, i.ToString("D5") + ".dat");
             var bytes = ReadBytes(ifs, dsa, e);
             WriteBytes(path, bytes);
+            objectsWritten++;
 
             var dt = DosDateTime.Decode(e.mDosDateTime);
             if (dt.HasValue) {
@@ -328,6 +338,10 @@ internal static class Program {
             Directory.CreateDirectory(root);
             for (int i = 0; i < dsa.Count; i++) {
                 var e = (Dsa3Entry)dsa.Entries[i];
+                if (IsClearlyNonexistent(e)) {
+                    Console.Error.WriteLine($"warn: by-index: skipping non-existent entry {i:D5} (name='{e.Name ?? ""}', size={e.Size}, offset={e.Offset}, date={e.mDosDateTime})");
+                    continue; // don't link nonexistent entries
+                }
                 var safeName = SanitizeFileName(string.IsNullOrEmpty(e.Name) ? "NO_NAME" : e.Name);
                 var linkName = $"{i:D5}__{safeName}";
                 var dest = Path.Combine(root, linkName);
@@ -356,7 +370,15 @@ internal static class Program {
                         }
                         continue;
                     }
+                    if (idx < 0 || idx >= dsa.Count) {
+                        Console.Error.WriteLine($"warn: module-slot: module '{m.Name ?? ""}' (#{mi}) slot {s:D5} maps to invalid file index {idx} (file_count={dsa.Count}); skipping.");
+                        continue;
+                    }
                     var e = (Dsa3Entry)dsa.Entries[idx];
+                    if (IsClearlyNonexistent(e)) {
+                        Console.Error.WriteLine($"warn: module-slot: module '{m.Name ?? ""}' (#{mi}) slot {s:D5} maps to nonexistent entry {idx:D5}; skipping.");
+                        continue;
+                    }
                     var safeName = SanitizeFileName(string.IsNullOrEmpty(e.Name) ? "NO_NAME" : e.Name);
                     var dest = Path.Combine(modDir, $"{slotName}__{idx:D5}__{safeName}");
                     LinkToObject(dest, objectsIdx, idx, mode);
@@ -380,8 +402,16 @@ internal static class Program {
                 for (int s = 0; s < m.Size; s++) {
                     int idx = (int)dsa.mModMap[start + s];
                     if (idx == 0xFFFF) continue;
+                    if (idx < 0 || idx >= dsa.Count) {
+                        Console.Error.WriteLine($"warn: module-name: module '{m.Name ?? ""}' (#{mi}) slot {s:D5} maps to invalid file index {idx} (file_count={dsa.Count}); skipping.");
+                        continue;
+                    }
 
                     var e = (Dsa3Entry)dsa.Entries[idx];
+                    if (IsClearlyNonexistent(e)) {
+                        Console.Error.WriteLine($"warn: module-name: module '{m.Name ?? ""}' (#{mi}) slot {s:D5} maps to nonexistent entry {idx:D5}; skipping.");
+                        continue;
+                    }
                     var baseName = string.IsNullOrEmpty(e.Name) ? "NO_NAME" : e.Name;
                     var safe = SanitizeFileName(baseName);
                     var dest = Path.Combine(modDir, safe);
@@ -407,8 +437,16 @@ internal static class Program {
                 for (int s = 0; s < m.Size; s++) {
                     int idx = (int)dsa.mModMap[start + s];
                     if (idx == 0xFFFF) continue;
+                    if (idx < 0 || idx >= dsa.Count) {
+                        Console.Error.WriteLine($"warn: by-name: module '{m.Name ?? ""}' (#{mi}) slot {s:D5} maps to invalid file index {idx} (file_count={dsa.Count}); skipping.");
+                        continue;
+                    }
 
                     var e = (Dsa3Entry)dsa.Entries[idx];
+                    if (IsClearlyNonexistent(e)) {
+                        Console.Error.WriteLine($"warn: by-name: module '{m.Name ?? ""}' (#{mi}) slot {s:D5} maps to nonexistent entry {idx:D5}; skipping.");
+                        continue;
+                    }
                     var folder = SanitizeDirName(string.IsNullOrEmpty(e.Name) ? "NO_NAME" : e.Name);
                     var dir = Path.Combine(root, folder);
                     Directory.CreateDirectory(dir);
@@ -421,6 +459,7 @@ internal static class Program {
         }
 
         Console.Error.WriteLine($"exported objects + views → {outRoot}");
+        Console.Error.WriteLine($"summary: objects written={objectsWritten}, empty entries skipped={objectsSkippedEmpty}");
         return 0;
     }
 
@@ -502,6 +541,11 @@ internal static class Program {
             }
         } catch { /* non-fatal */ }
 
+        if (!File.Exists(src)) {
+            Console.Error.WriteLine($"warn: missing source object for index {entryIndex:D5} at '{src}'; skipping link '{destPath}'");
+            return;
+        }
+
         switch (mode.ToLowerInvariant()) {
             case "hard":
                 if (!TryCreateHardLink(destPath, src)) {
@@ -526,6 +570,17 @@ internal static class Program {
             default:
                 throw new ArgumentException("mode must be hard|symlink|copy");
         }
+    }
+
+    // Detect clearly non-existent entries in the file table (no name + zero size/offset/date)
+    private static bool IsClearlyNonexistent(Dsa3Entry e) {
+        // Consider an entry non-existent only if:
+        //  - name is empty OR raw name bytes are all zero
+        //  - AND size, offset, and FAT datetime are all zero
+        bool noName = string.IsNullOrEmpty(e.Name) || string.IsNullOrWhiteSpace(e.Name);
+        bool rawZero = e.NameRaw13 != null && e.NameRaw13.All(b => b == 0);
+        bool zeroMeta = e.Size == 0 && e.Offset == 0 && e.mDosDateTime == 0;
+        return (noName || rawZero) && zeroMeta;
     }
 
     // Relative path helper (for prettier symlinks)
@@ -1510,6 +1565,7 @@ private static int UnixSymlink(string target, string @new) => symlink(target, @n
                 if (mapIdx < 0 || mapIdx >= dsa.mModMap.Count) continue;
                 var idx = (int)dsa.mModMap[mapIdx];
                 if (idx == 0xFFFF) yield return (mod, slot, null);
+                else if (idx < 0 || idx >= dsa.Count) yield return (mod, slot, null);
                 else yield return (mod, slot, idx);
             }
         }
@@ -1551,7 +1607,7 @@ private static int UnixSymlink(string target, string @new) => symlink(target, @n
 
     private static int PrintTopHelp() {
         Console.WriteLine(@"
-RivaXtract — DSA3 archive tooling
+RivaXtract — DSA3 ALF archive tooling
 
 Usage:
   rivaxtract <command> [args]
