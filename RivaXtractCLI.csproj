@@ -14,7 +14,11 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RepositoryType>git</RepositoryType>
-    <RepositoryUrl>https://example.invalid/RivaXtractCLI</RepositoryUrl>
+    <RepositoryUrl>https://github.com/cmsautter/RivaXtractCLI/</RepositoryUrl>
+    <PackageProjectUrl>https://tinion.tech</PackageProjectUrl>
   </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="ContactEmail" Value="sautter@tinion.tech" />
+  </ItemGroup>
 
 </Project>
