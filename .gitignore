@@ -1,0 +1,15 @@
+.vs/
+bin/
+obj/
+publish/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.idea/
+.DS_Store
+Thumbs.db
+ehthumbs.db
+*.swp
+*.tmp
+

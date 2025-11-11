@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>rivaxtract</AssemblyName>
+    <Version>0.1.0</Version>
+    <Authors>[tinion] Carl Marvin Sautter</Authors>
+    <Company>[tinion]</Company>
+    <Product>RivaXtract CLI</Product>
+    <Description>DSA3 ALF archive tooling: list, extract, read, modify, build, and export views/JSON.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://example.invalid/RivaXtractCLI</RepositoryUrl>
+  </PropertyGroup>
+
+</Project>
